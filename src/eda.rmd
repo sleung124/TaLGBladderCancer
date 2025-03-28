@@ -22,7 +22,9 @@ test.metadata <- test %>% select(-exprs)
 ```
 
 ```{r}
-is.na(train.metadata)
-colnames(train.metadata)
+colMeans(is.na(train.metadata))
+# colnames(train.metadata)
+
+head(train.metadata)
 ```
 
