@@ -5,10 +5,11 @@ date: "2025-03-28"
 output: html_document
 ---
 
-```{r load in data}
+```{r load in data, message=FALSE, warning=FALSE}
 library(here)
 library(tidyverse)
 library(ggplot2)
+library(Seurat)
 
 # read in training and test data
 train <- readRDS(here("data", "UROMOL_TaLG.teachingcohort.rds"))
@@ -21,10 +22,114 @@ train.metadata <- train %>% select(-exprs)
 test.metadata <- test %>% select(-exprs)
 ```
 
-```{r}
-colMeans(is.na(train.metadata))
-# colnames(train.metadata)
+```{r metadata column sync}
+# columns that confound prediction of recurrence
+confound <- c("Progression", "PFS_time.", "Recurrence", "RFS_time", "FUtime_days.")
 
-head(train.metadata)
+# columns that are irrelevant
+irr <- c("UROMOL.ID", "Tumor.stage", "Tumor.grade")
+
+# keep only columns between both train and test sets
+keep <- intersect(colnames(test.metadata), colnames(train.metadata %>% select(-c(confound, irr))))
+print("Common metadata columns to keep: ")
+keep 
+```
+```{r metadata missing value analysis}
+# check for missing data in the response variable `Recurrence`
+# do this for both test and train sets
+train.missing_response <- train.metadata$Recurrence %>% is.na()
+train.metadata <- train.metadata[!train.missing_response,]
+train.expr <- train.expr[!train.missing_response,]
+
+test.missing_response <- test.metadata$Recurrence %>% is.na()
+test.metadata <- test.metadata[!test.missing_response,]
+test.expr <- test.expr[!test.missing_response,]
+
+# out of the subsetted variables: check which ones have NAs
+print("Preprocessing Training Data summary:")
+train.metadata[,keep] %>% is.na() %>% colMeans() %>% round(2)
+
+# Check for test set as well
+print("Preprocessing Testing Data Summary")
+test.metadata[,keep] %>% is.na() %>% colMeans() %>% round(2)
+
+# only 1% of cells in Age are missing from training set. Imputing NA's by mean age for simplicity
+train.metadata <- train.metadata %>%
+  mutate(Age = if_else(is.na(Age), round(mean(Age, na.rm=TRUE), 0), Age))
 ```
 
+```{r expr data analysis}
+# find common genes between train and test set
+keep.genes <- intersect(colnames(train.expr), colnames(test.expr))
+
+# check for missing values in gene sets
+print("Total number of missing values in training set: ")
+train.expr[,keep.genes] %>% is.na() %>% sum()
+
+print("Total number of missing values in testing set: ")
+test.expr[,keep.genes] %>% is.na() %>% sum()
+```
+
+No missing gene expressions (Yippee!)
+
+However, the training set is from RNA-seq data and the test set is microarray data. From a quick glance of the data, it seems like the data are from separate distributions
+
+```{r train-test glance}
+print("Train set quick view")
+train.expr[1:5, keep.genes[1:5]]
+
+print("Test set quick view")
+test.expr[1:5, keep.genes[1:5]]
+```
+
+Given this issue, normalization with metrics from the train set will most likely not be comparable to those of the test set. We opt to log-transform the expression data to make the two datasets more comparable: 
+
+```{r log train-test glance}
+print("Train set quick view after log transform")
+log(train.expr[1:5, keep.genes[1:5]] + 1)
+
+print("Test set quick view after log transform")
+log(test.expr[1:5, keep.genes[1:5]] + 1)
+```
+
+## Clustering
+
+We want to see how well gene expression can separate the data, so we perform unsupervised clustering on the training set:
+
+```{r train-set-cluster-and-plot, warning=FALSE}
+# create seurat object
+seurat <- CreateSeuratObject(counts = t(train.expr[,keep.genes]))
+
+# log-normalize
+seurat <- NormalizeData(seurat, verbose = FALSE)
+
+# find variable features + scale data
+seurat <- FindVariableFeatures(seurat, verbose = FALSE)
+seurat <- ScaleData(seurat, verbose = FALSE)
+
+# Perform PCA + UMAP + Leiden Clustering
+seurat <- RunPCA(seurat, verbose = FALSE)
+seurat <- RunUMAP(seurat, dims = 1:20, verbose = FALSE)
+seurat <- RunTSNE(seurat, dims = 1:20, verbose = FALSE)
+seurat <- FindNeighbors(seurat, verbose = FALSE)
+seurat <- FindClusters(seurat, algorithm = 4, random.seed = 124, verbose = FALSE)
+```
+
+```{r View Clusters}
+# view raw clustering
+DimPlot(object = seurat, reduction = "umap")
+DimPlot(object = seurat, reduction = "tsne")
+
+# view clustering with recurrence labels
+seurat$Recurrence = ifelse(train.metadata$Recurrence, "Recurrence", "No Recurrence")
+DimPlot(object = seurat, reduction = "umap", group.by = "Recurrence")
+DimPlot(object = seurat, reduction = "tsne", group.by = "Recurrence")
+
+# view clustering based on EAU risk
+seurat$EAU = train.metadata$EAU.risk
+DimPlot(object = seurat, reduction = "umap", group.by = "EAU")
+DimPlot(object = seurat, reduction = "tsne", group.by = "EAU")
+```
+
+## Observations from unsupervised clustering
+- Leiden clusters do not re-capitulate recurrence or EAU clusters very well
