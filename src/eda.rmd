@@ -1,9 +1,13 @@
 ---
 title: "EDA of datasets"
-author: "Samuel"
+author: "Samuel Leung"
 date: "2025-03-28"
 output: html_document
 ---
+
+# Exploratory Data Analysis
+
+Short RMarkdown file to briefly preprocess data
 
 ```{r load in data, message=FALSE, warning=FALSE}
 library(here)
@@ -34,6 +38,7 @@ keep <- intersect(colnames(test.metadata), colnames(train.metadata %>% select(-c
 print("Common metadata columns to keep: ")
 keep 
 ```
+
 ```{r metadata missing value analysis}
 # check for missing data in the response variable `Recurrence`
 # do this for both test and train sets
@@ -57,6 +62,23 @@ test.metadata[,keep] %>% is.na() %>% colMeans() %>% round(2)
 train.metadata <- train.metadata %>%
   mutate(Age = if_else(is.na(Age), round(mean(Age, na.rm=TRUE), 0), Age))
 ```
+```{r analyze-rfs}
+# look at missing rfs data in train set
+train.metadata$RFS_time %>% is.na() %>% sum()
+
+# look at missing rfs data in test set
+test.metadata$RFS_time %>% is.na() %>% sum()
+
+# impute missing RFS using FU time
+test.metadata$RFS_time[is.na(test.metadata$RFS_time)] = test.metadata %>% 
+  filter(is.na(RFS_time)) %>%
+  mutate(RFS_time = round(FUtime_days./30)) %>%
+  select(RFS_time) %>%
+  pull()
+
+is.na(test.metadata$RFS_time)
+```
+
 
 ```{r expr data analysis}
 # find common genes between train and test set
@@ -82,7 +104,7 @@ print("Test set quick view")
 test.expr[1:5, keep.genes[1:5]]
 ```
 
-Given this issue, normalization with metrics from the train set will most likely not be comparable to those of the test set. We opt to log-transform the expression data to make the two datasets more comparable: 
+Given this issue, normalization with metrics from the train set will most likely not be comparable to those of the test set. We opt to log-transform the expression data to make the two datasets more comparable:
 
 ```{r log train-test glance}
 print("Train set quick view after log transform")
@@ -129,7 +151,27 @@ DimPlot(object = seurat, reduction = "tsne", group.by = "Recurrence")
 seurat$EAU = train.metadata$EAU.risk
 DimPlot(object = seurat, reduction = "umap", group.by = "EAU")
 DimPlot(object = seurat, reduction = "tsne", group.by = "EAU")
+
+# view clustering based on UROMOL ID
+seurat$UROMOL = train.metadata$UROMOL2021.classification
+DimPlot(object = seurat, reduction = "umap", group.by = "UROMOL")
+DimPlot(object = seurat, reduction = "tsne", group.by = "UROMOL")
 ```
 
 ## Observations from unsupervised clustering
-- Leiden clusters do not re-capitulate recurrence or EAU clusters very well
+
+-   Leiden clusters do not re-capitulate recurrence, EAU risk, or UROMOL identification clusters
+
+### Save filtered train + test sets
+
+```{r save-filtered-sets}
+# combine metadata and expr datasets by UROMOL id
+# also add back response variable
+train.to_save <- merge(train.metadata[,c("Recurrence","RFS_time",keep)], train.expr[,keep.genes], by = "row.names")
+test.to_save <- merge(test.metadata[,c("Recurrence","RFS_time",keep)], test.expr[,keep.genes], by = "row.names")
+
+# save to data directory
+saveRDS(train.to_save, file = here("data", "filtered_train_set.rds"))
+saveRDS(test.to_save, file = here("data", "filtered_test_set.rds"))
+```
+

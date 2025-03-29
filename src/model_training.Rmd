@@ -1,0 +1,208 @@
+---
+title: "model_training"
+author: "Samuel Leung"
+output: html_document
+date: "2025-03-29"
+---
+
+# Model Training
+
+RMarkdown file to train classifier to predict bladder cancer recurrence.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load-data}
+library(here)
+library(tidyverse)
+library(glmnet)
+library(survival)
+library(ggsurvfit)
+library(pROC)
+# library(survminer)
+
+# load in training and testing sets
+train <- readRDS(here("data", "filtered_train_set.rds"))
+test <- readRDS(here("data", "filtered_test_set.rds"))
+rownames(train) <- train$Row.names
+train$Row.names <- NULL
+rownames(test) <- test$Row.names
+test$Row.names <- NULL
+
+# Clarify on data types in table
+train$Recurrence <- as.factor(train$Recurrence)
+train$Sex <- as.factor(train$Sex)
+train$Concomitant.CIS <- as.factor(train$Concomitant.CIS)
+train$UROMOL2021.classification <- as.factor(train$UROMOL2021.classification)
+train$BCG <- as.factor(train$BCG)
+
+test$Recurrence <- as.factor(test$Recurrence)
+test$Sex <- as.factor(test$Sex)
+test$Concomitant.CIS <- as.factor(test$Concomitant.CIS)
+test$UROMOL2021.classification <- as.factor(test$UROMOL2021.classification)
+test$BCG <- as.factor(test$BCG)
+
+# Prepare the predictors (excluding 'Recurrence')
+# too many genes (running into protection stack overflow issue)
+# using top 10000 variable genes
+not_genes <- colnames(train)[1:7]
+gene_var <- apply(train%>%select(-not_genes), 2, var)
+top_genes <- names(sort(gene_var, decreasing=TRUE)[1:5000])
+
+# train[,top_genes] = log(train[,top_genes] + 1)
+# test[,top_genes] = log(test[,top_genes] + 1)
+
+# names of non-gene predictors
+nongene_pred <- colnames(train)[3:7]
+
+# one-hot encode non-numerical columns (factors)
+train.rows <- dim(train)[1]
+test.rows <- dim(test)[1]
+temp <- rbind(train, test) %>%
+  select(c(nongene_pred, top_genes)) %>%
+  # mutate(across(where(is.numeric), asinh)) %>%
+  model.matrix(~ . - 1, data = .)  # Convert factors to dummy variables
+
+x_train <- temp[1:train.rows,]
+x_test <- temp[(train.rows+1):dim(temp)[1],]
+
+dim(x_train)
+dim(x_test)
+
+# sanity check for colnames across both sets being the same
+sum(colnames(train) == colnames(test)) == dim(train)[2]
+```
+
+## What models will we train?
+
+Use logistic regression with L1 and L2 regularization. Bayesian Hiearchical model took too much memory. 
+
+## Training the model
+
+```{r MODELTRAININGTIMEKEKEKEK, warning=FALSE}
+# Response variable
+y_train <- train$Recurrence
+
+# grid of alphas to tune
+alpha_values <- seq(0, 1, by = 0.1)
+
+# Fit the elastic net model
+cv_results <- lapply(alpha_values, function(alpha_val) {
+  cv.glmnet(x_train, y_train, family = "binomial", alpha = alpha_val, 
+            type.measure = "auc")
+})
+
+# find best
+cv_errors <- sapply(cv_results, function(cv) max(cv$cvm))  
+best_index <- which.min(cv_errors) 
+
+# best model
+model <- cv_results[[best_index]]
+
+# View lambdas + best alpha
+print(alpha_values[[best_index]])
+print(model$lambda.min)  # Best lambda
+print(model$lambda.1se)
+
+print(paste0("Best AUC: ", round(max(model$cvm), 2)))
+```
+
+```{r Build survival curve, warning=FALSE}
+# get risk scores, aka predicted prob. 
+risk_scores <- predict(model, newx = x_train, s = "lambda.min", type = "response")
+
+# Categorize into high-risk vs low-risk (based on median risk score)
+median_risk <- median(risk_scores)
+train$risk_group <- as.factor(ifelse(risk_scores > median_risk, "High-Risk", "Low-Risk"))
+
+# Now create Kaplan-Meier curves based on risk group
+# Fit survival model
+df <- data.frame(time = train$RFS_time,
+                 event = train$Recurrence,
+                 risk_group = train$risk_group)
+
+# surv_obj <- Surv(time, event) ~ 1
+km_fit <- survfit(Surv(df$time,df$event)~df$risk_group)
+km_summary <- summary(km_fit)
+
+
+km_fit.plot_dat <- data.frame(
+  strata = ifelse(km_summary$strata=="df$risk_group=Low-Risk", 
+                  "Low Risk", "High Risk"),
+  time = km_summary$time,
+  survival = km_summary$pstate[,1],
+  lower = km_summary$lower[,1],
+  upper = km_summary$upper[,1]
+)
+
+ggplot(km_fit.plot_dat, aes(x = time, y = survival, color = strata)) +
+  geom_step() +  # Kaplan-Meier step function
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = strata), alpha = 0.2) +  # Confidence interval
+  labs(title = "Kaplan-Meier Survival Curve", 
+       x = "Time", y = "Survival Probability") +
+  theme_minimal()
+
+# make ROC curve
+plot(roc(y_train, risk_scores), col = "blue", main = "ROC curve on train set")
+auc(roc(y_train, risk_scores))
+```
+
+
+## Test on validation set
+
+```{r testing}
+# declare response
+y_test <- test$Recurrence
+
+# predicted probs
+pred_prob <- predict(model, newx = x_test, s = "lambda.min", type = "response")
+pred <- ifelse(pred_prob>0.5,1,0)
+
+# generate confusion matrix
+table(Predicted = pred, Actual = y_test)
+```
+
+```{r}
+# get risk scores, aka predicted prob. 
+risk_scores <- pred_prob
+
+# Categorize into high-risk vs low-risk (based on median risk score)
+median_risk <- median(risk_scores)
+test$risk_group <- as.factor(ifelse(risk_scores > median_risk, "High-Risk", "Low-Risk"))
+
+# Now create Kaplan-Meier curves based on risk group
+# Fit survival model
+df <- data.frame(time = test$RFS_time,
+                 event = test$Recurrence,
+                 risk_group = test$risk_group)
+
+# surv_obj <- Surv(time, event) ~ 1
+km_fit <- survfit(Surv(df$time,df$event)~df$risk_group)
+km_summary <- summary(km_fit)
+
+
+km_fit.plot_dat <- data.frame(
+  strata = ifelse(km_summary$strata=="df$risk_group=Low-Risk", 
+                  "Low Risk", "High Risk"),
+  time = km_summary$time,
+  survival = km_summary$pstate[,1],
+  lower = km_summary$lower[,1],
+  upper = km_summary$upper[,1]
+)
+
+ggplot(km_fit.plot_dat, aes(x = time, y = survival, color = strata)) +
+  geom_step() +  # Kaplan-Meier step function
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = strata), alpha = 0.2) +  # Confidence interval
+  labs(title = "Kaplan-Meier Survival Curve", 
+       x = "Time", y = "Survival Probability") +
+  theme_minimal()
+
+# make ROC curve
+plot(roc(y_test, risk_scores), col = "blue", main = "ROC curve on test set")
+auc(roc(y_test, risk_scores))
+```
+
+
+
+
